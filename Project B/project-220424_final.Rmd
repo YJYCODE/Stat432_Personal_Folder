@@ -1,0 +1,628 @@
+---
+title: "Exploring Alcohol Use and Annual family income influential factors in NHANES 2017-18."
+author: "Gen Li and Jiayue Yang"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: yes
+    code_folding: show
+    code_download: TRUE
+---
+
+```{r knitr_init, echo=FALSE, cache=FALSE, warning = FALSE}
+library(knitr); library(rmdformats)
+
+## Global options
+opts_chunk$set(echo=TRUE,
+               cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+## Preliminaries {-}
+
+```{r load_necessary_packages_for_your_analyses}
+# I think every project will need at least these packages
+library(here)
+library(janitor)
+library(knitr)
+library(magrittr)
+library(naniar)
+library(gtsummary)
+library(broom)
+library(rsample)
+library(yardstick)
+library(rms)
+library(MASS)
+library(stats)
+library(magrittr)
+library(gmodels)
+library(nnet)
+library(mosaic)
+library(countreg)
+library(nhanesA)
+library(pscl)
+library(Hmisc)
+library(patchwork)
+library(simputation)
+library(conflicted)
+library(ROCR)
+library(tidyverse)
+library(base)
+theme_set(theme_bw())
+conflict_prefer("filter","dplyr")
+conflict_prefer("select","dplyr")
+conflict_prefer("zeroinfl","pscl")
+conflict_prefer("sum", "base")
+conflict_prefer("rsq", "yardstick")
+```
+
+# Background
+
+The purpose of this project is to study and discuss what factors influence a person's alcohol consumption and annual household income. The amount of daily drinking is caused by many factors. We hope to find the factors that affect people's drinking to find a way to help some people who need to quit drinking. Similarly, there are many factors that affect household income, and we want to build a model to predict the annual household income level. As covid-19 has changed the way people live, we will choose to use the 2017-2018 data from NHANES.
+
+# Research Questions
+
+1. What's the relationship between number of average daily drinking and personal social and health conditions?  
+
+2. How well can we predict annual family income base on the characters of family members?
+
+# My Data
+
+The source of my data is NHANES 2017-2018. The National Health and Nutrition Examination Survey (NHANES) is a program of studies designed to assess the health and nutritional status of adults and children in the United States. We selected variables that we thought were related to alcohol consumption and household income.   
+
+## Data Ingest
+
+Read data from Nhanes package. And we'll rename these variables.
+
+```{r}
+database_raw<-merge(nhanes('ALQ_J'),nhanes('DEMO_J'))%>%
+  merge(nhanes('BPX_J'))%>%
+  merge(nhanes('HDL_J'))%>%
+  merge(nhanes('TRIGLY_J'))%>%
+  merge(nhanes('SMQ_J'))%>%
+  merge(nhanes('CBQ_J'))%>%
+  merge(nhanes('PAQ_J'))%>%
+  merge(nhanes('WHQ_J'))%>%
+  select(SEQN,RIDSTATR,
+         ALQ130,ALQ121,RIDAGEYR,RIDRETH3,BPXSY1,LBDHDD,LBDLDL,
+         INDFMIN2,SMQ040,DMDEDUC2,PAQ610,CBD091,WHD140)
+names(database_raw)=c("SEQN","Interview",
+                      "Daily_drink","Drink_freq","Age","Race","SBP","HDL","LDL",
+                      "Income","Smoking","Education","Vigorous_work","Nonfood_bill","Greatest_weight")
+```
+
+
+## Tidying, Data Cleaning and Data Management
+
+Here we want to clean the raw data. The first step is filter samples with complete outcomes: `Daily_drink` and `Income`. Then we want to remove samples who have missing in `Greatest_weight`,	`Income`, `Nonfood_bill` and `Education` because the missing rate of these variables is less than 5%. Removing them will not make a great difference.
+
+`Race` also remove level of 7, which indicates other races. Because in analysis of question 1, we want to find the relationship between culture and drinking, "other races" can give poor information about it.
+
+
+```{r}
+database_raw$Daily_drink<-ifelse(database_raw$Drink_freq==0,0,database_raw$Daily_drink)
+## Creating a counting outcome for question 1
+
+data1_raw<-database_raw%>%
+  filter(Interview==2)%>%
+  filter(is.na(database_raw$Daily_drink)==0)%>%
+  filter(Daily_drink!=777&Daily_drink!=999)%>% ## drop missing in our outcome
+  filter(Income!=77&Income!=99&Income!=12&Income!=13)%>%
+  filter(Education!=9&Education!=7&
+           Nonfood_bill!=777777&
+           Nonfood_bill !=999999&
+           Drink_freq !=77&Drink_freq!=99&
+           Greatest_weight!=7777&Greatest_weight!=9999&
+           Race!=7) ## which indicates other races
+ 
+```
+
+```{r}
+miss_var_summary(database_raw)
+```
+
+After removing missing samples, there are still five variables that isn't complete. Then we'd use imputation
+
+```{r missingness}
+gg_miss_var(data1_raw)
+miss_var_summary(data1_raw)
+miss_case_table(data1_raw)
+dim(data1_raw)
+```
+
+After removing missing samples, we still have about 1700 samples left. We will use this data set in analysis of question 1&2. 
+
+
+## Imputation
+
+We chose the single imputations for five variables for it is simplicity in using and translating, and we hpythosized the following relationships among the missing varables and the other related categorical or numerical variables. The predictive mean matching method and robust linear regression method are used during this process.
+
+```{r}
+set.seed(432)
+data1_imp<-data1_raw%>%
+  impute_pmm(HDL~Age+Race+Income)%>%
+  impute_rlm(LDL~Income+Education)%>%
+  impute_rlm(SBP~Age+Education)%>%
+  impute_pmm(Vigorous_work~Age+Race)%>%
+  impute_pmm(Smoking~Age+Race)
+```
+
+## Rename levels of categorical variables
+
+Now we want to rename levels of categorial variables to make it easier to understand.
+
+```{r}
+data1_imp<-data1_imp%>%
+  mutate(Race=Race%>%as.factor()%>%
+           fct_recode("Mexican_American"="1",
+                      "Other_Hispanic"="2",
+                      "Non-Hispanic_White"="3",
+                      "Non-Hispanic_Black"="4",
+                      "Non-Hispanic_Asian"="6"
+                      ),
+         Smoking=Smoking%>%as.factor()%>% 
+           fct_recode("Smoke_Every_day"="1",
+                      "Some_Days"="2",
+                      "Never_Smoke"="3"),
+         Education=Education%>%as.factor()%>%as.numeric(),
+         
+         Annual_family_income = case_when(
+           Income<=5~"1_Low_income_level",
+           Income>5&Income<=9~"2_Middle_income_level",
+           Income>9~"3_High_income_level"),
+         
+         AFI_factor=Annual_family_income%>%as.factor(),
+         AFI_factor = factor(AFI_factor, ordered = TRUE),
+  
+  )%>%
+  as_tibble()
+```
+
+## Tidied Tibble
+
+```{r list_the_tibble}
+data1_imp
+```
+
+
+```{r}
+saveRDS(data1_imp, file="Nhanes17-18.Rds")
+```
+
+# Code Book and Clean Data Summary
+
+
+```{r, warning = FALSE}
+data1_imp %>% 
+    select(Daily_drink, Age, Race, SBP, HDL, LDL, AFI_factor,
+           Income, Smoking,Vigorous_work,Education, Nonfood_bill, Greatest_weight) %>%
+    tbl_summary(.,label = list(
+            Daily_drink = "Daily_drink: Avg # alcohol drinks/day(in last 12 months)",
+            Age = "Age: Age in years at screening ",
+            RIDRETH1 = "Race/Hispanic origin",
+            SBP = "SBP: Systolic Blood Pres",
+            HDL = "HDL: HDL-Cholesterol (mg/dL)",
+            LDL = "LDL: LDL-cholesterol (mg/dL)",
+            Smoking = "Smoking: Smoking status",
+            Income = "Annual famiy income: income as discrete numbers representing the level of the income; the bigger the number the more the family earns",
+            AFI_factor = "AFI_factor: Annual family income regrouped as Low, Middle(Medium), and High",
+            Vigorous_work = "Vigorous_work: Number of days vigorous work",
+            Education = "Education: Education level ",
+            Nonfood_bill = "Nonfood_bill: Money spent on nonfood items",
+            Greatest_weight = "Greatest_weight: Self-reported greatest weight (pounds)"),
+            stat = list( all_continuous() ~ 
+                "{median} [{min} to {max}]"))
+```
+
+
+```{r}
+data1_imp %>% describe(.) %>% Hmisc::html()
+```
+
+# Analysis
+
+## Qustion 1
+
+## Splitting the Data
+
+```{r}
+set.seed(432)
+train_1<-sample_frac(data1_imp,0.7)
+test_1<-setdiff(data1_imp,train_1)
+```
+
+I'd take 70 percent samples as training data and others as testing data.
+
+```{r}
+hist(train_1$Daily_drink)
+mosaic::favstats(~Daily_drink,data=train_1)
+```
+
+Here is the distribution of outcome. We can find that 75% samples are equal or less than 2 and there are only fewer samples when k>6. Also, the zero point has too many observations. Therefore, a Zero-Inflation model may fit data well.
+
+## fit model
+
+We decide to fit four models. Using Poisson distribution and negative binomial distribution, Zero-Inflation(fit zero counting as observed value) model and original model respectively.
+
+```{R}
+ZIP<-zeroinfl(Daily_drink~Age+Race+SBP+HDL+LDL,data=train_1)
+Poisson<-glm(Daily_drink~Age+Race+SBP+HDL+LDL,data=train_1,
+               family = "poisson")
+ZINB<-zeroinfl(Daily_drink~Age+Race+SBP+HDL+LDL,
+                   data=train_1,dist ="negbin" )
+Bino<-MASS::glm.nb(Daily_drink~Age+Race+SBP+HDL+LDL,data=train_1)
+  
+```
+
+```{r}
+par(mfrow = c(2,2))
+rootogram(ZIP)
+rootogram(Poisson)
+rootogram(ZINB)
+rootogram(Bino)
+```
+
+
+Looking at these rootogram plots, the gap between histogram and x-axis is the difference between expected count and observed count(the residuals).  
+
+Both Poisson models have more expected counting than exact when k=3, 4, 5, 7 and 9. However, both negative binomial models only fit more than exact counting when k=7 and 9.    
+
+In fact, there are only 1 observation when k=7 and 1 observation when k=9. So this may due to bias in data collection.  
+
+All models don't fit well when the counting k is larger than 10. There are too fewer observation and expected counting.  
+
+```{r}
+AIC(ZIP,Poisson,ZINB,Bino)
+```
+
+Comparing AIC for different models, the two negative Binomial models have lower AIC than two Poisson models. Two zero-Inflation models have lower AIC than two original models.   
+
+Zero-inflation models contains more coefficients and costs more degrees of freedom. The increasing of AICs implies that those modifications are necessary.
+ 
+Therefore, we may think the ZINB model fits best.  
+
+## Goodness of fit
+
+Now we want to test whether the best model is negative Binomial ZI model.
+
+We can use training data to calculate R-square, square root of mean error and maximum error of all models and compared with each other.  
+
+Here is those statistics for negative binomial ZI model:
+
+```{r,warning=FALSE}
+ZINB_aug <- train_1 %>%
+    mutate(".fitted" = predict(ZINB, type = "response"),
+           ".resid" = resid(ZINB, type = "response"))
+mets<-metric_set(rsq,rmse,mae)
+ZINB_sum<-mets(ZINB_aug,truth=Daily_drink,estimate=.fitted)%>%
+  mutate(model="ZINB")%>%relocate(model)
+ZINB_sum%>%kable()
+
+```
+
+```{r}
+Bino_aug <- train_1 %>%
+    mutate(".fitted" = predict(Bino, type = "response"),
+           ".resid" = resid(Bino, type = "response"))
+Bino_sum<-mets(Bino_aug,truth=Daily_drink,estimate=.fitted)%>%
+  mutate(model="Bino")%>%relocate(model)
+
+Poisson_aug <- train_1 %>%
+    mutate(".fitted" = predict(Poisson, type = "response"),
+           ".resid" = resid(Poisson, type = "response"))
+Poisson_sum<-mets(Poisson_aug,truth=Daily_drink,estimate=.fitted)%>%
+  mutate(model="Poisson")%>%relocate(model)
+
+ZIP_aug <- train_1 %>%
+    mutate(".fitted" = predict(ZIP, type = "response"),
+           ".resid" = resid(ZIP, type = "response"))
+ZIP_sum<-mets(ZIP_aug,truth=Daily_drink,estimate=.fitted)%>%
+  mutate(model="Poisson-ZI")%>%relocate(model)
+
+```
+
+Here is the summary of four models.
+
+```{r}
+bind_rows(ZINB_sum,Bino_sum,
+  Poisson_sum,ZIP_sum)%>%
+  pivot_wider(names_from = model,
+              values_from = .estimate)%>%
+  kable(digits = 3)
+
+```
+
+ZINB model still has highest R-squared and least square root mean standard error and maximum error. This model has best performance fitting training data.
+
+
+## test data
+
+We can also use test data to calculate those statistics and find whether there is overfitting.
+
+```{r}
+test_ZINB<-predict(ZINB,newdata=test_1,type="response")
+ZINB_sum2<-mets(test_1,truth = Daily_drink,estimate=test_ZINB)%>%
+  mutate(model="ZINB")%>%relocate(model)
+ZINB_sum2%>%kable(digits = 3)
+```
+
+In this case, the R-square becomes lower and error terms become bigger compared with result from training data.
+
+Let's look at other models' results.
+
+```{r}
+test_Bino<-predict(Bino,newdata=test_1,type="response")
+Bino_sum2<-mets(test_1,truth = Daily_drink,estimate=test_Bino)%>%
+  mutate(model="Bino")%>%relocate(model)
+
+test_ZIP<-predict(ZIP,newdata=test_1,type="response")
+ZIP_sum2<-mets(test_1,truth = Daily_drink,estimate=test_ZIP)%>%
+  mutate(model="ZIP")%>%relocate(model)
+
+test_Poisson<-predict(Poisson,newdata=test_1,type="response")
+Poisson_sum2<-mets(test_1,truth = Daily_drink,estimate=test_Poisson)%>%
+ mutate(model="Poisson")%>%relocate(model)
+
+
+```
+
+```{r}
+bind_rows(ZINB_sum2,Bino_sum2,
+  Poisson_sum2,ZIP_sum2)%>%
+  pivot_wider(names_from = model,
+              values_from = .estimate)%>%
+  kable(digits = 3)
+
+```
+
+Still, the ZINB model fit test data best among these models.  
+
+However, we can find even ZINB model is the best one among these four candidates, it contains R-square of 0.13, which means the model can only explain 13% of variance of the outcome. It's a very low level and the result will be poor prediction.  
+
+## Conclusion
+
+We think negative binomial Zero-inflation model is the model we can use to explain the some features of the data.
+
+Here is its coefficients and rootogram plot:
+
+```{r}
+rootogram(ZINB)
+```
+```{r}
+summary(ZINB)
+```
+
+We can find that this model contains two part: A logistic model to indicate whether the outcome equals to zero and a counting regression model to estimate outcome that larger than zero.
+
+Compared with those coefficients, we can find the effect:
+
+  Age: people tend to drink with age increases but the old people will drink less than the young. For example, a 60-year-old person will drink as much as 70% of a 40-year-old person with identical social and health conditions.
+
+Because we can calculate exp(-0.0178970*20)=0.70.
+
+	Race: The baseline of race is Mexican American. We can find that most Hispanic and White people drink. But Mexican American drink most everyday. Black and Asian people drink least and most of them never drink.
+	
+	SBP: Both of the coefficients of SBP in two parts are positive, which indicates that people drink/drink more will have higher SBP compared with people don’t drink/drink less.
+	
+	HDL/LDL: Both of the coefficients of LDL and HDL in two parts are negative, which indicates that People drink/drink more will have lower HDL and LDL level compared with people don’t drink/ drink less.
+
+## Limitation 
+
+Even if we can have conclusions above from ZINB model, there is still one issue we cannot ignore: the R-square is only 0.13. In another word, it's a poor prediction and all analysis and conclusions may be wrong.
+
+One way to improve the model is changing the list of predictors.  
+
+From the result of ZINB model, we can find `HDL` and `LDL` have very small effect on detecting drinking situation. They should be considered whether to remove from this model at first.   
+
+Also, we can think about other predictions that can be added in our models.
+
+
+
+
+
+# Qustion 2
+
+In question 2, we want to use education levels, smoking status, vigorous work day, nonfood money spend, alcohol drinking and the self-reported greatest weight to predict the class of the annual family income factor, `AFI_Factor`. This outcome variable is defined by the `Income` variable and it has three levels: 1: 1_Low_income_level with `Income` <= 5; 2:"2_Middle_income_level" with `Income` is 6, 7, 8 or 9; 3. 3_High_income_level with `Income` being 10 and above. The distribution of the `AFI_Factor` can be viewed below in the bar chart. 
+
+```{r}
+train_1 %>% count(AFI_factor)
+ggplot(train_1, aes(x = AFI_factor, fill = AFI_factor)) + 
+    geom_bar(aes(y = (..count..)/sum(..count..))) +
+    geom_text(aes(y = (..count..)/sum(..count..), 
+                  label = scales::percent((..count..) / 
+                                        sum(..count..))),
+              stat = "count", vjust = 1, 
+              color = "white", size = 5) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_brewer(palette = "Dark2") +
+    guides(fill = "none") + 
+    labs(y = "Percentage")
+```
+
+In the variable AFI_factor, we have almost uniformly distributed counts in the three classes: 336 observations in low class, 459 observations in middle(medium) class, and 419 in high class. 
+
+```{r}
+plot(spearman2(AFI_factor ~ Smoking + Education + Vigorous_work + Greatest_weight + Drink_freq, data=train_1))
+```
+In the spearman plot, we can see that there is an obvious non-linear relationship between the XXXX and XXXX. Even though we would like to keep the model as simple as possible, this non-linearity is something to keep in mind for a more complicated model when the simple model's performance turns out poorly. I will continue to explore the relationships among variables and the target in below. 
+
+## Exploring the variables
+
+First we want to test the relationship between the class of annual income and the other variables. We used violin charts to explore the numerical ones and cross-tab tables with column-wise marginal proportions to explore the possible effects of each category of the categorical variables.
+
+```{r}
+ggplot(train_1, aes(x = AFI_factor, y = Greatest_weight )) +
+    geom_violin(aes(fill = AFI_factor), trim = TRUE) +
+    geom_boxplot(width = 0.2) +
+    guides(fill = "none", color = "none") +
+    theme_bw()
+
+ggplot(train_1, aes(x = AFI_factor, y = Drink_freq )) +
+    geom_violin(aes(fill = AFI_factor), trim = TRUE) +
+    geom_boxplot(width = 0.2) +
+    guides(fill = "none", color = "none") +
+    theme_bw()
+
+ggplot(train_1, aes(x = AFI_factor, y = Nonfood_bill )) +
+    geom_violin(aes(fill = AFI_factor), trim = TRUE) +
+    geom_boxplot(width = 0.2) +
+    guides(fill = "none", color = "none") +
+    theme_bw()
+
+table_ed <- table(train_1$AFI_factor, train_1$Education)
+prop.table(table_ed,2)
+
+table_smoke <- table(train_1$AFI_factor, train_1$Smoking)
+prop.table(table_smoke,2)
+
+table_wk <- table(train_1$AFI_factor, train_1$Vigorous_work)
+prop.table(table_wk,2)
+```
+
+In the violin plots, we did not see much variances among classes of `AFI_factor` with variable `Greatest_weight`,indicating possibly a weak influence on the target from this variable. Better variations in distributions of `drink_freq` and `Nonfood_bill` among the target were observed, indicating possible better discrimination powers with these variables, and we see that the higher the income class the higher the median of the `Greatest_weight` and `Nonfood_bill`. However, both the `drink_freq` and `Nonfood_bill` are better to distinguish the low income class from the rest but it is weak to tell apart the middle class from the high; 
+
+For categorical variables, we did see a higher education can lead to a better income class, however, for the other categorical variables, it was not easy to tell the how well they can help predicting the target without further statistical testings or modelings. 
+
+In the next, we will start with a toy model, and then a full kitchen sink model, and then finally select a best model.
+
+
+## A toy model 
+
+I built a model using the proportional odds logistic regression to predict the target with the variable for self reported greatest weight.
+
+```{r}
+m1 <- polr(AFI_factor ~ Greatest_weight , data = train_1, Hess = TRUE)
+summary(m1)
+confint(m1,level = 0.90)
+```
+
+I will use an example to test the model, suppose Harry, Sally and Jerry have Self reported greatest weight 1, 7 and 10. And as I expected, I found that with different Vigorous working day, the probability of the target does not vary very much, indicating a very poor discrimination power using this variable alone. 
+
+```{r}
+temp.dat <- data.frame(name = c("Harry", "Sally","Jerry"), 
+                       Greatest_weight  = c(1,7,10))
+predict(m1, temp.dat, type = "p")
+```
+
+
+## Model 2 - A Kitchen Sink Model
+Then I fitted the model2 without eliminating interaction using polr function.
+I have built a six predictors model; the model contains two intercepts and ten slopes. After checking the stepwise procedure,  I find that the model without predictor Greatest_weight is best for this model.
+
+```{r}
+m2 <- polr(AFI_factor ~ Smoking + Education + Vigorous_work + Nonfood_bill+ Drink_freq + Greatest_weight, data = train_1)
+summary(m2)
+stats::step(m2)
+```
+To obtain the appropriate Wald tests, I used lrm function to fit the model instead. 
+
+```{r}
+d <- datadist(train_1)
+options(datadist = "d")
+m2_lrm <- lrm(AFI_factor ~ Smoking + Education + Vigorous_work + Nonfood_bill+ Drink_freq, data = train_1, x = T, y = T)
+m2_lrm
+```
+
+In the odds ratio plot, we can see that the odds ratio for nonfood_bill, drink_freq, and education-graduate/higher is bigger than one, which indicates a positive association. Other variables have odd ratios that are less than one, which indicates a negative association.
+
+```{r}
+exp(coef(m2))
+exp(confint(m2))
+summary(m2_lrm)
+plot(summary(m2_lrm))
+```
+
+
+## Test model2
+From the result of validation, we might expect a Nagelkerke  R^2 of 0.1961 and a C statistic value = 0.5 + (0.41/2) = 0.705> 0.5. The model is at correctly classifying outcomes.
+
+```{r}
+set.seed(432); 
+validate(m2_lrm)
+```
+Then we want to test Proportional Odds Assumption.
+
+```{r}
+m2_multi <- multinom(Annual_family_income ~ Smoking + Education + Vigorous_work + Nonfood_bill + Drink_freq+ Greatest_weight, data = train_1)
+```
+The result of the test is significant, suggesting that we have a problem somewhere with the proportional odds assumption. Then I built some plot of score residuals. In the plots, as the annual family income change, the value of variables doesn't change much, which means they are stable.
+
+```{r}
+LL_2 <- logLik(m2)
+LL_2m <- logLik(m2_multi)
+(G <- -2 * (LL_2[1] - LL_2m[1]))
+pchisq(G, 9, lower.tail = FALSE)
+
+par(mfrow = c(3,3))
+resid(m2_lrm, 'score.binary', pl=TRUE)
+par(mfrow= c(1,1))
+
+```
+
+## Model3 - A model without interactions
+We want to fit a model without interactions. We want to fit a restricted cubic spline with 5 knots on education level and a restricted cubic spline with 3 knots on drink frequency. We also want to eliminate the interaction between alcohol use, vigorous work day and smoke status. Due to the result of stepwise procedure, we find that with predictor smoking, education level, nonfood money spend and drinking frequency is best for this model.
+
+```{r}
+m3 <- polr(AFI_factor ~ Smoking + rcs(Education,5) + Vigorous_work + Nonfood_bill+ rcs(Drink_freq,3) + Greatest_weight
+  +Drink_freq %ia% Vigorous_work+Smoking %ia% Drink_freq+Vigorous_work %ia% Smoking , data = train_1)
+
+summary(m3)
+stats::step(m3)
+```
+
+```{r}
+m3_lrm <- lrm(AFI_factor ~ Smoking + rcs(Education, 5)  +
+                Nonfood_bill+rcs(Drink_freq,3)+Smoking %ia% Drink_freq, 
+              data = train_1, x = T, y = T)
+
+m3_lrm
+```
+In the odds ratio plot, we can see that the odds ratio for education, drink_freq, and nonfood money spend is bigger than one, which indicates a positive association. Other variables shown have odd ratios that are less than one, which indicates a negative association.
+
+```{r}
+summary(m3_lrm)
+plot(summary(m3_lrm))
+```
+
+From the result of validation, we might expect a Nagelkerke  R^2 of 0.1931 and a C statistic value = 0.5 + (0.4/2) = 0.7> 0.5. The model is at correctly classifying outcomes.
+
+```{r}
+set.seed(432); 
+validate(m3_lrm)
+```
+
+## Comparison
+```{r}
+anova(m3, m2)
+AIC(m3_lrm, m2_lrm)
+BIC(m3_lrm, m2_lrm)
+```
+
+Comparing the 2 model, model 2 has a lower BIC and a bigger R square and C statistics value, I prefer model 2 as the final model.
+
+## Conclusions
+
+Our question for outcome 2 is "How well can we predict the class of the annual family income base on the characters of family members?" We built a with Education level, smoking status, vigorous work day, nonfood money spend, alcohol drinking and Self-reported greatest weight A model without interaction and a model without interaction. After testing, the model interaction is better.
+
+There are still shortcomings in our model, such as our AIC and BIC are relatively large, indicating that the results may not be so accurate. But this model can already explain the relationship between variables and annual income to a certain extent. We can achieve the purpose of increasing annual income through the model. For me, at the beginning I was hesitant to add the greatest weight to the model, but the class notes gave me the inspiration to take it out for analysis, which is the most valuable way to think about the project. In the next steps, I will choose to add a new predictor to further explore what affects annual income.
+
+# References and Acknowledgments
+
+The source of our dataset:
+https://wwwn.cdc.gov/Nchs/Nhanes/continuousnhanes/default.aspx?BeginYear=2017
+
+Discrete Mathematics and Probability Theory by Anant Sahai:
+https://inst.eecs.berkeley.edu/~cs70/fa14/notes/n7.pdf
+    
+# Session Information
+
+```{r}
+xfun::session_info()
+```
+
